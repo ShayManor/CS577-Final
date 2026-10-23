@@ -218,3 +218,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+CLAUDE.md
+docs/superpowers/
+
+data/
+rater/web/node_modules/
+rater/web/dist/
+.idea/

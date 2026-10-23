@@ -1,0 +1,17 @@
+name: spot-loco
+# MuJoCo Spot walking (scripts/train_spot_policy.py, nuance.spot_walk), separate from the habitat env "nuance"
+# because MuJoCo Playground needs python >= 3.10. jax and flax are pinned: brax 0.14.2 breaks on jax 0.10.
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - jax[cuda12]==0.7.2
+      - flax==0.11.2
+      - brax==0.14.2
+      - mujoco==3.16.0
+      - mujoco-mjx==3.16.0
+      - playground==0.2.0
+      - pillow
+      - pytest

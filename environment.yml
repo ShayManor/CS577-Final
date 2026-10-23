@@ -1,0 +1,16 @@
+name: nuance
+channels:
+  - aihabitat
+  - conda-forge
+dependencies:
+  - python=3.9
+  - habitat-sim=0.3.3=*headless_bullet*
+  - numpy
+  - pytest
+  - pip
+  - pillow
+  - pip:
+      - imageio
+      - imageio-ffmpeg
+      - huggingface_hub
+      - pygltflib

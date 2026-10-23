@@ -1,0 +1,35 @@
+:root { color-scheme: light; }
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: #f4f4f2;
+  color: #222;
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
+.page {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 24px 16px;
+  gap: 18px;
+}
+.instruction { font-size: 40px; font-weight: 600; margin: 0; text-align: center; }
+.video {
+  /* Clips are the chase view and the top-down side by side, 2400 x 1024. */
+  width: min(96vw, calc(72vh * 2400 / 1024));
+  aspect-ratio: 2400 / 1024;
+  background: #000;
+  border-radius: 6px;
+  display: block;
+}
+.progress { font-size: 15px; color: #666; }
+.error { font-size: 15px; color: #b00020; min-height: 20px; }
+.legend { font-size: 13px; color: #777; text-align: center; }
+.legend kbd {
+  background: #fff; border: 1px solid #ccc; border-radius: 3px;
+  padding: 1px 5px; font-family: inherit; font-size: 12px;
+}
+.center { margin: auto; text-align: center; display: flex; flex-direction: column; gap: 14px; align-items: center; }
+.center input { font-size: 18px; padding: 8px 12px; border: 1px solid #bbb; border-radius: 4px; }
+.center button { font-size: 16px; padding: 8px 18px; border: 0; border-radius: 4px; background: #333; color: #fff; cursor: pointer; }
