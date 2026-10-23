@@ -12,7 +12,7 @@ def rate(c, item_id, score=3, rater="a"):
 def test_next_advances_after_rate(client):
     n1 = nxt(client)
     assert n1["position"] == 1 and n1["total"] == 60
-    assert n1["video_url"] == f"/clips/{n1['clip_id']}.mp4"
+    assert n1["video_url"] == f"/clips/{n1['clip_id']}.mp4?v=2"
     assert rate(client, n1["item_id"]).status_code == 200
     n2 = nxt(client)
     assert n2["item_id"] != n1["item_id"] and n2["position"] == 2
@@ -74,3 +74,10 @@ def test_clip_served_and_root(client):
     n = nxt(client)
     assert client.get(n["video_url"]).status_code == 200
     assert client.get("/").status_code == 200
+
+
+def test_rater_name_ignores_case(client):
+    n = nxt(client, rater="shay")
+    assert rate(client, n["item_id"], rater="SHAY").status_code == 200
+    assert rate(client, n["item_id"], rater="Shay").status_code == 409
+    assert nxt(client, rater="Shay")["position"] == 2

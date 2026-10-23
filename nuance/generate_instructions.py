@@ -31,7 +31,7 @@ import numpy as np
 
 from nuance import config as cfg
 from nuance import grounding as G
-from nuance.candidates import (AROUND, SEATS, SPEED_TARGET, say, _grouped, _members, SPEED_V0_BY_KIND, WALK_MAX_SPEED, Decision, _lateral_room, at, dense, ground, heading_at, length,
+from nuance.candidates import (AROUND, SEATS, _corners, SPEED_TARGET, say, _grouped, _members, SPEED_V0_BY_KIND, WALK_MAX_SPEED, Decision, _lateral_room, at, dense, ground, heading_at, length,
                                max_turn_deg, shortest, v3, valid)
 from nuance.config import FPS, HOLD_S, T_DECISION_S
 from nuance.context import measure_context
@@ -203,9 +203,38 @@ def _good_spot(sim, dec: Decision) -> bool:
     return all(sim.pathfinder.is_navigable(q.astype(np.float32)) for q in back)
 
 
+def _corner_decision(sim, scene_id, rng, all_objs):
+    """Spot walking roughly toward a wall-to-wall corner 2.5-5 m ahead that it can see: random lines almost never
+    face one."""
+    pf = sim.pathfinder
+    corners = [c for c, _ in _corners(sim, scene_id)]
+    for c in rng.sample(corners, min(len(corners), 5)):
+        for _ in range(20):
+            p = np.array(pf.get_random_navigable_point_near(c.astype(np.float32), 5.0, 50), dtype=float)
+            v = (c - p)[[0, 2]]
+            if not np.isfinite(p).all() or abs(p[1] - c[1]) > 0.2 or not 2.5 <= np.linalg.norm(v) <= 5.0:
+                continue
+            t = np.arctan2(v[1], v[0]) + np.radians(rng.uniform(-20, 20))
+            h3 = v3([np.cos(t), np.sin(t)])
+            v0 = rng.uniform(*CONTEXT_SPEED_RANGE)
+            start = p - v0 * T_DECISION_S * h3
+            line = np.linspace(start, p, 10)
+            run_up = [start - k * h3 for k in np.arange(0.1, 0.3 + 0.75 * v0 + 0.5, 0.1)]
+            if not all(pf.is_navigable(q.astype(np.float32)) for q in [*line, *run_up]) or not body_clear(sim, line):
+                continue
+            post = shortest(sim, p, c)
+            if post is None or not G.sees_point(sim, G.front_camera(p, float(np.arctan2(-h3[0], -h3[2])), sim),
+                                                c + np.r_[0, 0.3, 0]):
+                continue
+            return _dec_from_path(scene_id, np.vstack([line[:-1], post]), v0, all_objs)
+    return None
+
+
 def sample_decision(sim, scene_id, rng, spec, all_objs):
     family = spec.family
-    if _aims(spec) and rng.random() < 0.8:
+    if family == "place" and spec.metric == "corner" and rng.random() < 0.8:
+        dec = _corner_decision(sim, scene_id, rng, all_objs)
+    elif _aims(spec) and rng.random() < 0.8:
         dec = _aimed_decision(sim, scene_id, rng, spec, all_objs)
     else:
         if family == "speed":
@@ -331,6 +360,12 @@ NOT_ALTS = {"keep to the side", "go over there", "avoid the obstacle", "go aroun
 SKIP = {"go over there"}  # "there" needs a pointing gesture the clips cannot show
 
 
+# the opposite request, which one of the candidates answers (the generic choice drops these as same-size synonyms)
+OPPOSITE = {"stay to the left": ["stay to the right"], "stay to the right": ["stay to the left"],
+            "keep to the side": ["stay to the left", "stay to the right"],
+            "take the long way around": ["take the shortest way"], "take the shortest way": ["take the long way around"]}
+
+
 def pick_alts(text: str, rng: random.Random, names=(), v0=None) -> list:
     """Up to two other instructions to rate the same clips under. Speed: phrases that one of the candidates (names)
     answers, one in another direction and one in the same direction at another size. Others: instructions about
@@ -345,6 +380,8 @@ def pick_alts(text: str, rng: random.Random, names=(), v0=None) -> list:
             if pool:
                 out.append(rng.choice(pool))
         return out
+    if text in OPPOSITE:
+        return OPPOSITE[text]
     alts = [t for t in same_kind(text) if t not in NOT_ALTS]
     rng.shuffle(alts)
     other = [t for t in alts if SPECS[t].metric != SPECS[text].metric]
@@ -369,6 +406,12 @@ def _same_spot(a: dict, b: dict) -> bool:
     return np.hypot(*(pa - pb)[[0, 2]]) < DEDUP_M and np.degrees(turn) < DEDUP_DEG
 
 
+def _same_target(a: dict, b: dict) -> bool:
+    """Both go to the same marked point (a corner, a doorway), even from different spots."""
+    ta, tb = a["referent"].get("door"), b["referent"].get("door")
+    return ta is not None and tb is not None and np.hypot(ta[0] - tb[0], ta[2] - tb[2]) < DEDUP_M
+
+
 def assign(scenes: list, instructions: list, per_instruction: int, seed: int, out: Path) -> list:
     options = defaultdict(list)
     for s in scenes:
@@ -380,9 +423,15 @@ def assign(scenes: list, instructions: list, per_instruction: int, seed: int, ou
     rng = random.Random(seed)
     load = Counter()
     chosen, missing = [], {}
+    # spots already in another batch's clips (NUANCE_AVOID, a clips.jsonl) count as taken
+    avoid = [{"scene_id": r["scene_id"], "pre": [r["decision_position"]], "yaw": r["decision_yaw"],
+              "family": r["action_type"]} for r in map(json.loads, open(os.environ["NUANCE_AVOID"]))
+             ] if os.environ.get("NUANCE_AVOID") else []
     # instructions with the fewest options pick first, so the common ones do not take their only spots
     for text in sorted(instructions, key=lambda t: len(options.get(t, []))):
-        opts = options.get(text, [])
+        # a spot another batch already has for this family adds nothing
+        opts = [o for o in options.get(text, []) if not any(
+            c["scene_id"] == o["scene_id"] and c["family"] == o["family"] and _same_spot(o, c) for c in avoid)]
         by_scene = defaultdict(list)
         for o in opts:
             by_scene[o["scene_id"]].append(o)
@@ -394,12 +443,12 @@ def assign(scenes: list, instructions: list, per_instruction: int, seed: int, ou
             def key(o):
                 s = o["scene_id"]
                 return (any(c["scene_id"] == s and (_same_spot(o, c) or c["family"] == o["family"] and _near(o, c))
-                            for c in chosen + picked), used[s], load[s], rng.random())
+                            for c in chosen + picked + avoid), used[s], load[s], rng.random())
             o = min((o for v in by_scene.values() for o in v), key=key)
             s = o["scene_id"]
             by_scene[s].remove(o)
-            if any(c["scene_id"] == s and _same_spot(o, c) for c in picked):
-                continue  # another decision point for this instruction at the same spot
+            if any(c["scene_id"] == s and (_same_spot(o, c) or _same_target(o, c)) for c in picked):
+                continue  # another decision point for this instruction at the same spot or the same target
             o = {**o, "backups": by_scene[s][:]}
             used[s] += 1
             load[s] += 1

@@ -6,6 +6,12 @@ const STEP = 0.5
 const NAME_KEY = 'rater_name'
 const AUTOPLAY_DELAY_MS = 2000
 
+// rater names ignore case and show as "Shay" (matches rater.server.canonical)
+function canonical(name: string): string {
+  const s = name.trim()
+  return s.slice(0, 1).toUpperCase() + s.slice(1).toLowerCase()
+}
+
 function loadName(): string {
   try {
     return localStorage.getItem(NAME_KEY) ?? ''
@@ -152,11 +158,12 @@ function Rater({ rater }: { rater: string }) {
 }
 
 export default function App() {
-  const [name, setName] = useState(loadName)
+  const [name, setName] = useState(() => canonical(loadName()))
   if (!name) {
     return (
       <NamePrompt
-        onSubmit={(n) => {
+        onSubmit={(raw) => {
+          const n = canonical(raw)
           saveName(n)
           setName(n)
         }}

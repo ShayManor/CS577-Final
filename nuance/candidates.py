@@ -4,6 +4,7 @@ Every generator takes a Decision and returns (referent, [Candidate] * 3) or None
 sense at that decision point (no such referent, it is ambiguous or out of view, or the candidates cannot differ enough).
 A candidate's path is the full line (the shared walk-in up to the decision point, then its own continuation).
 """
+import os
 import random
 from dataclasses import dataclass, field, replace
 
@@ -208,6 +209,36 @@ def straight(dec: Decision, d: float) -> np.ndarray:
     p = dec.p
     h = dec.heading
     return np.array([p, p + d * v3(h)])
+
+
+N_CANDS = int(os.environ.get("NUANCE_CANDS", 3))  # 5: a denser ladder for stop, approach and graded place
+
+
+def ladder(names):
+    """Candidate names (low, mid, high), or for N_CANDS = 5 with the in-betweens named after their neighbours."""
+    if N_CANDS == 3:
+        return names
+    a, b, c = names
+    return a, f"{a}_{b}", b, f"{b}_{c}", c
+
+
+def pick5(items, key, step, span, apart=None, pos=None):
+    """pick3's low and high plus three items about evenly between them, at least step / 2 apart by key (and apart
+    in position, 0.6 * apart) from each other; pick3 when N_CANDS is 3."""
+    base = pick3(items, key, step, span, apart, pos)
+    if base is None or N_CANDS == 3:
+        return base
+    chosen = [base[0], base[2]]
+
+    def ok(x):
+        return all(abs(key(x) - key(c)) >= step / 2 and (apart is None or np.linalg.norm(
+            np.asarray(pos(x)) - np.asarray(pos(c))) >= 0.6 * apart) for c in chosen)
+    for t in np.linspace(key(base[0]), key(base[2]), 5)[1:-1]:
+        fits = [x for x in items if ok(x)]
+        if not fits:
+            return None
+        chosen.append(min(fits, key=lambda x: abs(key(x) - t)))
+    return sorted(chosen, key=key)
 
 
 def pick3(items, key, step=CLEAR_STEP_M, span=CLEAR_SPAN_M, apart=None, pos=None):
@@ -653,12 +684,14 @@ def gen_side(sim, dec: Decision, spec, rng):
     routes, lmin, rmin = got
     if lmin < 0.6 or rmin < 0.6:
         return None
-    # symmetric about the line: right, middle and left by the same amount, up to 80% of the narrower side
-    a = 0.8 * min(lmin, rmin)
+    # symmetric about the middle of the free space: right, middle and left by the same amount, up to 80% of the
+    # half-width
+    c, a = (lmin - rmin) / 2, 0.8 * (lmin + rmin) / 2
     if a < 0.4 or not routes:
         return None
-    picked = [min(routes, key=lambda r: abs(r[0] - t)) for t in (-a, 0.0, a)]
-    if any(abs(p[0] - t) > 0.15 for p, t in zip(picked, (-a, 0.0, a))):
+    lanes = (c - a, c, c + a)
+    picked = [min(routes, key=lambda r: abs(r[0] - t)) for t in lanes]
+    if any(abs(p[0] - t) > 0.15 for p, t in zip(picked, lanes)):
         return None
     return ({"kind": "free_space", "left_m": lmin, "right_m": rmin},
             [Candidate(n, full(dec, p), dec.v0, c) for n, (c, p) in zip(("right", "middle", "left"), picked)])
@@ -783,14 +816,17 @@ def gen_length(sim, dec: Decision, spec, rng):
         return None
     mid = at(base, L / 2)
     routes = [(L, base)]
+    rooms = {id(G.region_of(dec.scene_id, q)) for q in dense(base, 0.5)}  # a detour does not visit another room
     pf = sim.pathfinder
     for _ in range(40):
         w = np.array(pf.get_random_navigable_point_near(mid.astype(np.float32), 3.5, 50), dtype=float)
         if not np.isfinite(w).all() or abs(w[1] - mid[1]) > 0.3:
             continue
         r = chain(sim, [dec.p, w, base[-1]])
+        # a detour, not a hairpin: no reversal spread over a couple of metres either
         if (r is not None and length(r) <= MAX_POST_M and valid(sim, dec, r)
-                and between_free(sim, base, r) <= 0.7):
+                and between_free(sim, base, r) <= 0.7 and max_turn_deg(r, w=0.75) <= 100
+                and {id(G.region_of(dec.scene_id, q)) for q in dense(r, 0.5)} <= rooms):
             routes.append((length(r), r))
     picked = pick3(routes, key=lambda r: r[0], step=0.8, span=1.8)
     if picked is None or picked[0][0] > L + 0.05:
@@ -814,6 +850,7 @@ def _straight_run(sim, dec: Decision, max_m: float = 10.0):
 
 
 STOPS = {"small": (0.4, 1.3, 3.0), "unspecified": (0.3, 1.5, 3.5)}  # m after the decision point
+STOPS5 = {"small": (0.3, 0.8, 1.5, 2.3, 3.0), "unspecified": (0.3, 0.9, 1.5, 2.5, 3.5)}
 
 
 def gen_stop(sim, dec: Decision, spec, rng):
@@ -822,19 +859,22 @@ def gen_stop(sim, dec: Decision, spec, rng):
         return None
     e, d, hit, oid = run
     if spec.referent == "end":
-        if not 4.0 <= d <= 7.0 or not np.isfinite(hit):
+        # the end is a wall or door right where the line stops, not an opening with more room beyond
+        eye, _ = G.ray(sim, G.front_camera(dec.p, dec.yaw, sim), v3(dec.heading), d + 2.0)
+        if not 4.0 <= d <= 7.0 or not hit <= 0.6 or not eye <= d + hit + 0.4 or not all(
+                G.indoor(dec.scene_id, dec.p + t * v3(dec.heading)) for t in np.arange(0.0, d + 0.5, 0.5)):
             return None
-        stops = (d / 3, 2 * d / 3, d)
+        stops = tuple(d * k / N_CANDS for k in range(1, N_CANDS + 1))
     elif spec.metric == "large":
         if d < 5.0:
             return None
-        stops = (0.4, 1.5, min(d, 6.0))
+        stops = (0.4, 1.5, min(d, 6.0)) if N_CANDS == 3 else (0.4, 1.5, 2.5, 4.0, min(d, 6.0))
     else:
         if d < 4.0:
             return None
-        stops = STOPS[spec.metric or "unspecified"]
+        stops = (STOPS if N_CANDS == 3 else STOPS5)[spec.metric or "unspecified"]
     cands = []
-    for name, s in zip(("short", "mid", "far"), stops):
+    for name, s in zip(ladder(("short", "mid", "far")), stops):
         post = straight(dec, s)
         # the line ends at the navmesh edge, where Spot's nose would touch; stop where body_clear allows
         while not valid(sim, dec, post) and s > 0.3:
@@ -843,7 +883,7 @@ def gen_stop(sim, dec: Decision, spec, rng):
         if not valid(sim, dec, post):
             return None
         cands.append(Candidate(name, full(dec, post), dec.v0, s))
-    if cands[1].metric - cands[0].metric < 0.8 or cands[2].metric - cands[1].metric < 0.8:
+    if any(b.metric - a.metric < (0.8 if N_CANDS == 3 else 0.4) for a, b in zip(cands, cands[1:])):
         return None
     return ({"kind": spec.referent, "run_m": d}, cands)
 
@@ -888,7 +928,8 @@ def gen_approach(sim, dec: Decision, spec, rng):
     to_ref = d + hit  # from the decision point to the referent, along the heading
     cands = []
     # gaps between Spot's nose and the referent; the walk stops up to ~0.15 m past the line's end (nuance.spot_walk)
-    for name, gap in (("far", 1.6), ("just_before", 0.7), ("closest", 0.25)):
+    gaps = (1.6, 0.7, 0.25) if N_CANDS == 3 else (2.2, 1.5, 1.0, 0.6, 0.25)
+    for name, gap in zip(ladder(("far", "just_before", "closest")), gaps):
         s = to_ref - SPOT_HALF_LENGTH - gap
         if s < 0.6:
             return None
@@ -899,7 +940,7 @@ def gen_approach(sim, dec: Decision, spec, rng):
         if not valid(sim, dec, post):
             return None
         cands.append(Candidate(name, full(dec, post), dec.v0, to_ref - SPOT_HALF_LENGTH - s))
-    if cands[1].metric - cands[2].metric < 0.25:
+    if cands[-2].metric - cands[-1].metric < 0.25:
         return None
     return ref, cands
 
@@ -939,12 +980,68 @@ def _openness(sim, g) -> float:
                           for q in pts]))
 
 
+A8 = np.linspace(0, 2 * np.pi, 8, False)
+CORNER_M = 1.0  # in a corner: both walls this close (the navmesh keeps Spot about 0.4 m off walls)
+
+
+def _cornered(sim, g) -> float:
+    """How far a spot is from sitting in a corner: over pairs of walls about square to each other, the farther of
+    the two, for the closest pair whose diagonal between them is closed too and whose walls both run on past the
+    corner (not the jamb of an opening or the edge of a wall block)."""
+    def wd(q, a):
+        return min(G.wall_distance(sim, q, [np.cos(a), np.sin(a)], 3.0, height=1.2), 3.0)
+    d = [wd(g, a) for a in A8]
+
+    def runs_on(i, j):
+        # the wall straight ahead in direction i still stands 0.5 m further away from wall j: a wall, not the
+        # end face of a block or the jamb of an opening
+        q = g - 0.5 * np.r_[np.cos(A8[j]), 0.0, np.sin(A8[j])]
+        return abs(wd(q, A8[i]) - d[i]) < 0.15
+    pairs = [max(d[i], d[(i + 2) % 8]) for i in range(8)
+             if d[(i + 1) % 8] <= 1.6 * max(d[i], d[(i + 2) % 8]) and max(d[i], d[(i + 2) % 8]) < 3.0
+             and runs_on(i, (i + 2) % 8) and runs_on((i + 2) % 8, i)
+             and min(_open_to(sim, g, A8[(i + 4) % 8]), _open_to(sim, g, A8[(i + 6) % 8])) >= 1.5]
+    return float(min(pairs, default=3.0))
+
+
+_CORNERS = {}
+
+
+def _corners(sim, scene_id, n: int = 4000) -> list:
+    """(spot, cornered) for navigable spots in a wall-to-wall corner of a room (rare among random points), found
+    once per scene."""
+    if scene_id not in _CORNERS:
+        out = []
+        for _ in range(n):
+            c = np.array(sim.pathfinder.get_random_navigable_point(), dtype=float)
+            room = G.region_of(scene_id, c) if np.isfinite(c).all() else None
+            if room is not None and room.area >= 10 and room.label not in NOT_ROOMS:
+                k = _cornered(sim, c)
+                if k <= CORNER_M:
+                    out.append((c, k))
+        _CORNERS[scene_id] = out
+    return _CORNERS[scene_id]
+
+
+def _open_to(sim, g, a) -> float:
+    """Free floor from g in direction a at sofa height, furniture included: the room opens out from a corner,
+    it is not the end of a corridor or of an aisle between a sofa and a wall."""
+    o = np.array([g[0], G.floor_at(sim, g) + 0.4, g[2]])
+    return min(G.ray(sim, o, [np.cos(a), 0.0, np.sin(a)], 3.0)[0], 3.0)
+
+
+def _wall_near(sim, g) -> float:
+    """Distance to the nearest wall-like surface at chest height (walls, doors, garage doors; not low furniture)."""
+    o = np.array([g[0], G.floor_at(sim, g) + 1.5, g[2]])
+    return float(min(min(G.ray(sim, o, [np.cos(a), 0.0, np.sin(a)], 3.0)[0], 3.0) for a in A8))
+
+
 def _place_cands(dec, picked, names):
-    return [Candidate(n, full(dec, r), dec.v0, float(m)) for n, (m, g, r) in zip(names, picked)]
+    return [Candidate(n, full(dec, r), dec.v0, float(m)) for n, (m, g, r) in zip(ladder(names) if len(picked) == 5 else names, picked)]
 
 
 def _pick_goals(scored, step, span, apart=GOAL_APART_M):
-    return pick3(scored, key=lambda x: x[0], step=step, span=span, apart=apart, pos=lambda x: x[1][[0, 2]])
+    return pick5(scored, key=lambda x: x[0], step=step, span=span, apart=apart, pos=lambda x: x[1][[0, 2]])
 
 
 def gen_place(sim, dec: Decision, spec, rng):
@@ -953,8 +1050,10 @@ def gen_place(sim, dec: Decision, spec, rng):
     if m == "open":
         goals = [(_openness(sim, g), g, r) for g, r in _goals(sim, dec, rng, cone_deg=75, min_clear=0.0)]
         goals = [x for x in goals if G.in_view(cam, dec.yaw, x[1]) and G.sees_point(sim, cam, x[1] + np.r_[0, 0.3, 0])]
-        picked = _pick_goals(goals, step=0.4, span=1.0, apart=2.0)
-        if picked is None or picked[2][0] < 1.6 or picked[0][0] > 0.5:
+        # three goals: above about 1 m of clearance, more open space no longer looks different
+        picked = pick3(goals, key=lambda x: x[0], step=0.4, span=1.0, apart=2.0, pos=lambda x: x[1][[0, 2]])
+        # graded: the middle goal is between, not already as open as the open one (an all-open hall)
+        if picked is None or picked[-1][0] < 1.6 or picked[0][0] > 0.5 or picked[len(picked) // 2][0] > 1.3:
             return None
         return {"kind": "open"}, _place_cands(dec, picked, ("cramped", "mid", "open"))
     if m == "aside":
@@ -968,15 +1067,14 @@ def gen_place(sim, dec: Decision, spec, rng):
             return None  # Spot already beside a wall: "the wall" would be that one
         goals = []
         for g, r in _goals(sim, dec, rng, cone_deg=120, min_clear=0.0):
-            w = min(G.wall_distance(sim, g, [np.cos(a), np.sin(a)], 3.0) for a in np.linspace(0, 2 * np.pi, 8, False))
-            goals.append((min(w, 3.0), g, r))
+            goals.append((_wall_near(sim, g), g, r))
         # "the wall" is one Spot can see: the spot by it is in view, and against a wall, not in an opening
         goals = [x for x in goals if here.contains(x[1]) and G.in_view(cam, dec.yaw, x[1])]
         goals = [x for x in goals if x[0] > 0.75 or (G.sees_point(sim, cam, x[1] + np.r_[0, 0.3, 0])
                                                      and sum(_lateral_room(sim, x[1], [1.0, 0.0])) > 1.4
                                                      and sum(_lateral_room(sim, x[1], [0.0, 1.0])) > 1.4)]
         picked = _pick_goals(goals, step=0.6, span=1.4, apart=2.0)
-        if picked is None or picked[0][0] > 0.75 or picked[1][0] < 1.2:
+        if picked is None or picked[0][0] > 0.75 or picked[len(picked) // 2][0] < 1.2:
             return None
         return {"kind": "wall"}, _place_cands(dec, picked, ("by_wall", "mid", "away"))
     if spec.referent in ("window", "door"):
@@ -1003,7 +1101,10 @@ def _near_object(sim, dec, rng, category):
         return None  # glass doors next to the window (or windows next to the door) make "the window" ambiguous
     if not (2.0 < np.hypot(*(o.center - dec.p)[[0, 2]]) < 6.0 and G.in_view(cam, dec.yaw, o.center, margin_deg=15)):
         return None
-    goals = [(float(o.dist_xz(g[None])[0]), g, r) for g, r in _goals(sim, dec, rng, n=200)]
+    others = [x for x in dec.all_objs if x.category in ("window", "door") and x is not o]
+    # no goal ends by another window or door, which a rater would take for "the window" too
+    goals = [(float(o.dist_xz(g[None])[0]), g, r) for g, r in _goals(sim, dec, rng, n=200)
+             if not any(x.dist_xz(g[None])[0] < 1.5 for x in others)]
     picked = _pick_goals(goals, step=1.0, span=2.5)
     if picked is None or picked[0][0] > 1.0:
         return None
@@ -1057,12 +1158,15 @@ def _next_room(sim, dec, rng):
              Candidate("through", full(dec, r), dec.v0, 2.0)])
 
 
+VIEW_H = 1.3  # m above the floor at which "seeing the whole room" is judged
+ROOM_MAX_M2 = 60.0  # an open-plan space or hall has no middle a rater agrees on
 NOT_ROOMS = {"hallway", "closet", "toilet", "entryway/foyer/lobby", "garage"}  # no middle, corner or view to speak of
 
 
 def _room(sim, dec, rng, metric):
     here = G.region_of(dec.scene_id, dec.p)
-    if here is None or (metric != "far" and (here.area < 10 or here.label in NOT_ROOMS)):
+    if here is None or (metric != "far" and (here.area < 10 or here.label in NOT_ROOMS)) or (
+            metric == "center" and here.area > ROOM_MAX_M2):
         return None
     cam = G.front_camera(dec.p, dec.yaw, sim)
     if metric != "far":
@@ -1071,39 +1175,48 @@ def _room(sim, dec, rng, metric):
         if here.edge_distance(dec.p) < 0.8 or (metric in ("center", "view") and not G.in_view(
                 cam, dec.yaw, np.r_[c[0], dec.p[1], c[1]], margin_deg=5)):
             return None
-    goals = [(g, r) for g, r in _goals(sim, dec, rng, n=200, cone_deg=110, min_clear=0.0 if metric == "corner" else
-                                        GOAL_CLEAR_M) if here.contains(g)]
+    # a room with a corner in view is often small, so few random goals land in it
+    goals = [(g, r) for g, r in _goals(sim, dec, rng, n=600 if metric == "corner" else 200, cone_deg=110,
+                                        min_clear=0.0 if metric == "corner" else GOAL_CLEAR_M) if here.contains(g)]
     if metric == "center":
         c = here.centroid
         scored = [(float(np.hypot(*(g[[0, 2]] - c))), g, r) for g, r in goals]
         picked = _pick_goals(scored, step=0.8, span=2.0)
-        if picked is None or picked[0][0] > 0.8:
+        # the middle a rater sees is open floor, not the aisle between an island and the counters
+        if picked is None or picked[0][0] > 0.8 or _openness(sim, picked[0][1]) < 0.8:
             return None
         return ({"kind": "room", "label": here.label, "door": _r(np.r_[c[0], dec.p[1], c[1]])},
                 _place_cands(dec, picked, ("center", "mid", "edge")))
     if metric == "corner":
-        # the one corner of the room outline that is in view ahead
-        def bearing(v):
-            w = v - dec.p[[0, 2]]
+        # "the corner" is a wall-to-wall corner ahead and in view; the other goals rank by how far from any corner
+        # they are, so none of them reads as a corner too
+        doors = [o for o in dec.all_objs if o.category == "door"]
+
+        def bearing(g):
+            w = (g - dec.p)[[0, 2]]
             return abs(np.degrees(np.arctan2(w @ G.left_of(dec.heading), w @ dec.heading)))
-        corners = [v for v in here.poly if np.hypot(*(v - dec.p[[0, 2]])) > 1.5 and bearing(v) < 25]
-        if not corners:
-            return None
-        v = min(corners, key=bearing)  # "the corner" is the one Spot is facing
-        scored = [(float(np.min(np.hypot(*(here.poly - g[[0, 2]]).T))), g, r) for g, r in goals]
-        def walled(g):
-            # a wall-to-wall corner: walls close by in two directions about square to each other
-            hit = [a for a in np.linspace(0, 2 * np.pi, 8, False)
-                   if np.isfinite(G.wall_distance(sim, g, [np.cos(a), np.sin(a)], 0.9, height=1.2))]
-            return any(60 <= np.degrees(abs((a - b + np.pi) % (2 * np.pi) - np.pi)) <= 120 for a in hit for b in hit)
-        near = [x for x in scored if np.hypot(*(x[1][[0, 2]] - v)) < 1.1 and walled(x[1])]
-        rest = [x for x in scored if x[0] > 1.5]
+        scored = [(_cornered(sim, g), g, r) for g, r in goals]
+        # random goals rarely land in a corner: add the scene's corner spots ahead in this room, routed to
+        spots = [(k, q) for q, k in _corners(sim, dec.scene_id) if here.contains(q) and bearing(q) < 35
+                 and abs(q[1] - dec.p[1]) < 0.3 and np.hypot(*(q - dec.p)[[0, 2]]) > 1.5]
+        for c, q in sorted(spots, key=lambda x: x[0])[:10]:
+            r = shortest(sim, dec.p, q)
+            if r is not None and length(r) <= PLACE_MAX_M and valid(sim, dec, r):
+                scored.append((c, q, r))
+        near = [x for x in scored if x[0] <= CORNER_M and bearing(x[1]) < 35
+                and G.sees_point(sim, cam, x[1] + np.r_[0, 0.3, 0])
+                and not any(o.dist_xz(x[1][None])[0] < 1.5 for o in doors)]
+        rest = [x for x in scored if x[0] > 1.6]
         if not near or not rest:
             return None
-        picked = _pick_goals([min(near, key=lambda x: x[0])] + rest, step=0.8, span=2.0)
-        if picked is None or picked[0][0] > 1.1:
+        # the other goals rank by distance from that corner, and none of them is in a corner itself
+        k, v, rv = min(near, key=lambda x: x[0])
+        # three goals: rooms with a corner in view leave too few other spots for five
+        picked = pick3([(0.0, v, rv)] + [(float(np.hypot(*(g - v)[[0, 2]])), g, r) for _, g, r in rest],
+                       key=lambda x: x[0], step=0.8, span=1.8, apart=GOAL_APART_M, pos=lambda x: x[1][[0, 2]])
+        if picked is None or picked[0][0] > 0.0:
             return None
-        return {"kind": "room", "label": here.label, "door": _r(np.r_[v[0], dec.p[1], v[1]])}, \
+        return {"kind": "room", "label": here.label, "door": _r(picked[0][1])}, \
             _place_cands(dec, picked, ("corner", "mid", "open"))
     if metric == "far":
         # the far end is the visible one straight ahead; nearer goals lie on the same line, not off to a side
@@ -1113,7 +1226,8 @@ def _room(sim, dec, rng, metric):
         if not scored or max(s[0] for s in scored) < 4.0:
             return None
         picked = _pick_goals(scored, step=1.2, span=2.5)
-        if picked is None:
+        # "the far end" is reached: the farthest goal is by the wall ahead, not mid-room in a big room
+        if picked is None or not np.isfinite(G.wall_distance(sim, picked[-1][1], dec.heading, 1.5)):
             return None
         return {"kind": "room", "label": here.label}, _place_cands(dec, picked, ("near", "mid", "far_end"))
     if metric == "view":
@@ -1123,14 +1237,15 @@ def _room(sim, dec, rng, metric):
             q = np.array(pf.get_random_navigable_point_near(np.r_[here.centroid[0], dec.p[1], here.centroid[1]]
                                                             .astype(np.float32), 6.0, 50), dtype=float)
             if np.isfinite(q).all() and here.contains(q):
-                probes.append(q + np.r_[0, 0.5, 0])
+                probes.append(q + np.r_[0, VIEW_H, 0])
             if len(probes) >= 40:
                 break
         if len(probes) < 20:
             return None
-        scored = [(np.mean([G.sees_point(sim, g + np.r_[0, 0.6, 0], q) for q in probes]), g, r) for g, r in goals]
+        # seen over tables and sofas, as a rater judges a view: only walls, partitions and tall furniture block it
+        scored = [(np.mean([G.sees_point(sim, g + np.r_[0, VIEW_H, 0], q) for q in probes]), g, r) for g, r in goals]
         picked = _pick_goals(scored, step=0.25, span=0.6, apart=2.0)
-        if picked is None:
+        if picked is None or picked[-1][0] - picked[0][0] < 0.25:
             return None
         return {"kind": "room", "label": here.label}, _place_cands(dec, picked, ("low_view", "mid", "full_view"))
     return None

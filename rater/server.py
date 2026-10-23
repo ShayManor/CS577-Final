@@ -10,6 +10,12 @@ from rater.queue import build_items, order_items
 DIST = Path(__file__).parent / "web" / "dist"
 
 
+def canonical(name) -> str:
+    """Rater names ignore case and are kept as "Shay": "shay", "SHAY" and "Shay" are one rater."""
+    s = str(name or "").strip()
+    return s[:1].upper() + s[1:].lower()
+
+
 def create_app(batch_dir: Path, db_path: Path) -> Flask:
     batch_dir = Path(batch_dir)
     app = Flask(__name__)
@@ -19,7 +25,7 @@ def create_app(batch_dir: Path, db_path: Path) -> Flask:
 
     @app.get("/api/next")
     def next_item():
-        rater = request.args.get("rater", "").strip()
+        rater = canonical(request.args.get("rater"))
         if not rater:
             return jsonify(error="rater required"), 400
         done, flagged = db.done_item_ids(rater), db.flagged_clip_ids(rater)
@@ -29,14 +35,15 @@ def create_app(batch_dir: Path, db_path: Path) -> Flask:
                 handled += 1
                 continue
             return jsonify(item_id=it.item_id, clip_id=it.clip_id, instruction=it.instruction,
-                           video_url=f"/clips/{it.clip_id}.mp4", position=handled + 1,
+                           # ?v= changes the URL so browsers and Cloudflare drop clips they cached as missing
+                           video_url=f"/clips/{it.clip_id}.mp4?v=2", position=handled + 1,
                            total=len(items))
         return jsonify(done=True)
 
     @app.post("/api/rate")
     def rate():
         body = request.get_json(silent=True) or {}
-        rater, score = str(body.get("rater") or "").strip(), body.get("score")
+        rater, score = canonical(body.get("rater")), body.get("score")
         item = by_id.get(body.get("item_id"))
         if not rater or item is None or type(score) is not int or not 1 <= score <= 5:
             return jsonify(error="bad request"), 400
@@ -47,7 +54,7 @@ def create_app(batch_dir: Path, db_path: Path) -> Flask:
     @app.post("/api/flag")
     def flag():
         body = request.get_json(silent=True) or {}
-        rater = str(body.get("rater") or "").strip()
+        rater = canonical(body.get("rater"))
         item = by_id.get(body.get("item_id"))
         if not rater or item is None:
             return jsonify(error="bad request"), 400
