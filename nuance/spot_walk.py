@@ -2,6 +2,7 @@
 
 Runs in the spot-loco env (python 3.11, mujoco, jax, brax, playground), not the habitat env:
     python -m nuance.spot_walk jobs.json out_dir
+    python -m nuance.spot_walk serve    (one jobs.json per stdin line, policy loaded once; see nuance.rollout)
 jobs.json holds the shared floor height map and one job per candidate (see generate.py, generate_instructions.py). Each job writes
 out_dir/<name>.npz with, at FPS, the clip times, Spot's base position and orientation in habitat coordinates, its 12
 leg joint angles (fl, fr, hl, hr x hx, hy, kn, the same order and convention as hab_spot_arm), and its progress
@@ -306,5 +307,19 @@ def main(jobs_file: str, out_dir: str) -> None:
         print(job["name"], "fell" if res["fell"] else f"{res['times'][-1]:.1f} s", flush=True)
 
 
+def serve() -> None:
+    """Run main on stdin lines {"jobs": jobs.json, "out": out_dir} with one walker, replying "{}" on stdout per line."""
+    proto, sys.stdout = sys.stdout, sys.stderr  # walk() prints falls; stdout carries only replies
+    w = load_walker(POLICY_DIR)
+    print("{}", file=proto, flush=True)
+    for line in sys.stdin:
+        req = json.loads(line)
+        spec = json.loads(Path(req["jobs"]).read_text())
+        for job in spec["jobs"]:
+            res = walk_job(w, spec["floor"], np.array(spec["path"]), job["v0"], job["v1"])
+            np.savez(Path(req["out"]) / f"{job['name']}.npz", **res)
+        print("{}", file=proto, flush=True)
+
+
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2])
+    serve() if sys.argv[1] == "serve" else main(sys.argv[1], sys.argv[2])
