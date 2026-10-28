@@ -184,7 +184,10 @@ class _Worker:
 
 
 def worker() -> None:
-    proto, sys.stdout = sys.stdout, sys.stderr  # habitat logs to stdout; it carries only replies
+    # replies go to a copy of stdout; fd 1 goes to stderr, so prints from python and C (habitat, mujoco) cannot mix in
+    proto = os.fdopen(os.dup(1), "w")
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
     w = _Worker()
     print("{}", file=proto, flush=True)
     for line in sys.stdin:

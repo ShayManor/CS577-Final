@@ -98,10 +98,7 @@ def action_of(r: dict) -> dict:
     post = path[k:]
     seg = np.linalg.norm(np.diff(post, axis=0), axis=1)
     cum = np.r_[0.0, np.cumsum(seg)]
-    half = cum[-1] / 2
-    i = min(int(np.searchsorted(cum, half, side="right")) - 1, len(seg) - 1)
-    f = (half - cum[i]) / max(seg[i], 1e-9) if len(seg) else 0.0
-    via = post[i] + f * (post[i + 1] - post[i]) if len(seg) else post[0]
+    via = np.array([np.interp(cum[-1] / 2, cum, post[:, j]) for j in range(3)])
     p, yaw = post[0], float(r["decision_yaw"])
     return {"via": to_ego(p, yaw, via), "goal": to_ego(p, yaw, post[-1]),
             "speed": round(float(r["candidate_speed"]), 2)}

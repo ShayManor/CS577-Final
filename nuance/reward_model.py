@@ -107,8 +107,9 @@ def _lora_targets(model) -> list:
 
 class RewardModel:
     def __init__(self, model: str = DEFAULT_MODEL, adapter=None, lora_r: int = 0, load_4bit: bool = False,
-                 device: str = "cuda"):
+                 device=None):
         import torch
+        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
         self.torch = torch
         meta = json.loads((Path(adapter) / "rm_meta.json").read_text()) if adapter else {}
@@ -205,6 +206,7 @@ def train(argv) -> None:
     ap.add_argument("--n-frames", type=int, default=N_FRAMES)
     ap.add_argument("--frame-w", type=int, default=FRAME_W)
     ap.add_argument("--load-4bit", action="store_true")
+    ap.add_argument("--device", default=None, help="default: cuda if there is a GPU")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args(argv)
 
@@ -219,7 +221,7 @@ def train(argv) -> None:
     frames = {v: clip_frames(v, args.n_frames, args.frame_w) for v in {e["video"] for e in exs}}
     print(f"decoded {len(frames)} clips ({time.time() - t0:.0f} s)", flush=True)
 
-    rm = RewardModel(args.model, lora_r=args.lora_r, load_4bit=args.load_4bit)
+    rm = RewardModel(args.model, lora_r=args.lora_r, load_4bit=args.load_4bit, device=args.device)
     rm.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     rm.model.enable_input_require_grads()
     rm.model.print_trainable_parameters()

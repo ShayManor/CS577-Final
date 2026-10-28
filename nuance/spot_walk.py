@@ -12,6 +12,7 @@ The policy is MuJoCo Playground's Spot joystick policy (scripts/train_spot_polic
 velocity command; a path follower turns the line and the clip's speed profile into that command each step.
 """
 import json
+import os
 import pickle
 import sys
 from dataclasses import dataclass
@@ -309,7 +310,10 @@ def main(jobs_file: str, out_dir: str) -> None:
 
 def serve() -> None:
     """Run main on stdin lines {"jobs": jobs.json, "out": out_dir} with one walker, replying "{}" on stdout per line."""
-    proto, sys.stdout = sys.stdout, sys.stderr  # walk() prints falls; stdout carries only replies
+    # replies go to a copy of stdout; fd 1 goes to stderr, so prints from python and C (habitat, mujoco) cannot mix in
+    proto = os.fdopen(os.dup(1), "w")
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
     w = load_walker(POLICY_DIR)
     print("{}", file=proto, flush=True)
     for line in sys.stdin:
