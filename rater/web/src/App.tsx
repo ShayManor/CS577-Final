@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { flag, getNext, rate, type Item } from './api'
+import { flag, getNext, getPrev, rate, type Item } from './api'
 
 const FRAME = 1 / 30
 const STEP = 0.5
@@ -73,6 +73,21 @@ function Rater({ rater }: { rater: string }) {
     void loadNext()
   }, [loadNext])
 
+  // B steps back to the previously scored item; a score typed there overrides the old one
+  const loadPrev = useCallback(async () => {
+    if (busy.current) return
+    try {
+      const p = await getPrev(rater, item?.item_id)
+      if ('none' in p) setError('No earlier rating to change')
+      else {
+        setItem(p)
+        setError('')
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'load failed')
+    }
+  }, [rater, item])
+
   const submit = useCallback(
     async (act: () => Promise<void>) => {
       if (busy.current) return
@@ -111,14 +126,16 @@ function Rater({ rater }: { rater: string }) {
         v.pause()
         v.currentTime = Math.min(Math.max(v.currentTime + d, 0), v.duration || 0)
       } else if (/^[1-5]$/.test(e.key)) {
-        void submit(() => rate(rater, item.item_id, Number(e.key)))
+        void submit(() => rate(rater, item.item_id, Number(e.key), item.score !== undefined))
       } else if (e.key === 'f' || e.key === 'F') {
         void submit(() => flag(rater, item.item_id))
+      } else if (e.key === 'b' || e.key === 'B') {
+        void loadPrev()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [item, rater, submit])
+  }, [item, rater, submit, loadPrev])
 
   if (done) {
     return (
@@ -147,10 +164,11 @@ function Rater({ rater }: { rater: string }) {
       />
       <div className="progress">
         {item.position} / {item.total}
+        {item.score !== undefined && <> &nbsp; changing rating {item.score}</>}
       </div>
       <div className="error">{error}</div>
       <div className="legend">
-        <kbd>1</kbd>-<kbd>5</kbd> score &nbsp; <kbd>F</kbd> broken &nbsp; <kbd>Space</kbd> play/pause &nbsp;
+        <kbd>1</kbd>-<kbd>5</kbd> score &nbsp; <kbd>F</kbd> broken &nbsp; <kbd>B</kbd> back &nbsp; <kbd>Space</kbd> play/pause &nbsp;
         <kbd>←</kbd> <kbd>→</kbd> 0.5 s &nbsp; <kbd>Shift</kbd>+<kbd>←</kbd> <kbd>→</kbd> 1 frame
       </div>
     </div>

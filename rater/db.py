@@ -30,6 +30,17 @@ class RatingsDB:
     def rate(self, rater: str, item: Item, score: int) -> bool:
         return self._insert(rater, item, score, 0)
 
+    def rerate(self, rater: str, item: Item, score: int) -> bool:
+        with self._conn() as c:
+            cur = c.execute("UPDATE ratings SET score=? WHERE rater=? AND item_id=? AND score IS NOT NULL",
+                            (score, rater, item.item_id))
+            return cur.rowcount == 1
+
+    def scores(self, rater: str) -> dict[str, int]:
+        with self._conn() as c:
+            return dict(c.execute(
+                "SELECT item_id, score FROM ratings WHERE rater=? AND score IS NOT NULL", (rater,)))
+
     def flag(self, rater: str, item: Item) -> None:
         with self._conn() as c:
             c.execute("UPDATE ratings SET flagged=1 WHERE rater=? AND item_id=?", (rater, item.item_id))

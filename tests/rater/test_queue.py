@@ -34,3 +34,17 @@ def test_order_min_gap_decision():
         if it.group in pos:
             assert n - pos[it.group] >= 5
         pos[it.group] = n
+
+
+def test_assign_shared_then_split():
+    from rater.queue import assign_items
+    from tests.rater.conftest import make_record
+    items = order_items(build_items([make_record(i) for i in range(50)]))
+    q = assign_items(items, ["Shay", "Henry"], shared=10)
+    ids = {r: [it.item_id for it in q[r]] for r in q}
+    head = [c[:10] for c in ids.values()]
+    assert head[0] == head[1] and len(set(head[0])) == 10
+    tails = [set(c[10:]) for c in ids.values()]
+    assert len(tails[0]) == len(tails[1]) == 70 and not tails[0] & tails[1]
+    assert set(head[0]) | tails[0] | tails[1] == {it.item_id for it in items}
+    assert q == assign_items(items, ["Shay", "Henry"], shared=10)

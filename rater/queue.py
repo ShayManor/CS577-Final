@@ -20,6 +20,18 @@ def build_items(records: list[ClipRecord]) -> list[Item]:
     return items
 
 
+def assign_items(items: list[Item], raters: list[str], shared: int = 100,
+                 seed: int = 0) -> dict[str, list[Item]]:
+    """Every rater gets the same `shared` random items first, then an even share of the rest."""
+    ids = sorted(it.item_id for it in items)
+    random.Random(seed).shuffle(ids)
+    common = set(ids[:shared])
+    owner = {i: raters[k % len(raters)] for k, i in enumerate(ids[shared:])}
+    first = order_items([it for it in items if it.item_id in common], seed)
+    return {r: first + order_items([it for it in items if owner.get(it.item_id) == r], seed)
+            for r in raters}
+
+
 def order_items(items: list[Item], seed: int = 0, min_gap: int = 5) -> list[Item]:
     rng = random.Random(seed)
     pool = list(items)

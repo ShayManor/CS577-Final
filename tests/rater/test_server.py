@@ -81,3 +81,24 @@ def test_rater_name_ignores_case(client):
     assert rate(client, n["item_id"], rater="SHAY").status_code == 200
     assert rate(client, n["item_id"], rater="Shay").status_code == 409
     assert nxt(client, rater="Shay")["position"] == 2
+
+
+def test_prev_overrides_rating(client, db_path):
+    import sqlite3
+    a = nxt(client)
+    rate(client, a["item_id"], 2)
+    b = nxt(client)
+    rate(client, b["item_id"], 4)
+    cur = nxt(client)
+    p = client.get(f"/api/prev?rater=a&item_id={cur['item_id']}").get_json()
+    assert p["item_id"] == b["item_id"] and p["score"] == 4 and p["position"] == 2
+    p2 = client.get(f"/api/prev?rater=a&item_id={p['item_id']}").get_json()
+    assert p2["item_id"] == a["item_id"] and p2["score"] == 2
+    assert client.get(f"/api/prev?rater=a&item_id={a['item_id']}").get_json() == {"none": True}
+    r = client.post("/api/rate", json={"rater": "a", "item_id": a["item_id"], "score": 5, "override": True})
+    assert r.status_code == 200
+    assert nxt(client)["item_id"] == cur["item_id"]
+    rows = sqlite3.connect(db_path).execute("SELECT item_id, score FROM ratings ORDER BY score").fetchall()
+    assert rows == [(b["item_id"], 4), (a["item_id"], 5)]
+    r = client.post("/api/rate", json={"rater": "a", "item_id": cur["item_id"], "score": 5, "override": True})
+    assert r.status_code == 404
