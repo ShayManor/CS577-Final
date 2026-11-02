@@ -43,9 +43,10 @@ def test_join_groups_and_flags(batch):
 def test_split_keeps_decisions_together(batch):
     b, db = batch
     exs = examples(load_ratings(db), load_clips([b]))
-    tr, va = split(exs, 0.34, seed=1)
-    assert not {e["group"] for e in tr} & {e["group"] for e in va}
-    assert len(tr) + len(va) == len(exs) and va
+    tr, va, te = split(exs, 0.34, 0.34, seed=1)
+    groups = [{e["group"] for e in x} for x in (tr, va, te)]
+    assert not groups[0] & groups[1] and not groups[0] & groups[2] and not groups[1] & groups[2]
+    assert len(tr) + len(va) + len(te) == len(exs) and tr and va and te
 
 
 def test_missing_clip_raises(batch):

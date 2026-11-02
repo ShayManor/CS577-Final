@@ -39,7 +39,7 @@ def create_app(batch_dir: Path, db_path: Path, raters=("Shay", "Henry")) -> Flas
                 continue
             return jsonify(item_id=it.item_id, clip_id=it.clip_id, instruction=it.instruction,
                            # ?v= changes the URL so browsers and Cloudflare drop clips they cached as missing
-                           video_url=f"/clips/{it.clip_id}.mp4?v=2", position=handled + 1,
+                           video_url=f"/clips/{it.clip_id}.mp4?v=3", position=handled + 1,
                            total=len(queue))
         return jsonify(done=True)
 
@@ -56,7 +56,7 @@ def create_app(batch_dir: Path, db_path: Path, raters=("Shay", "Henry")) -> Flas
             it = queue[k]
             if it.item_id in scores:
                 return jsonify(item_id=it.item_id, clip_id=it.clip_id, instruction=it.instruction,
-                               video_url=f"/clips/{it.clip_id}.mp4?v=2", position=k + 1,
+                               video_url=f"/clips/{it.clip_id}.mp4?v=3", position=k + 1,
                                total=len(queue), score=scores[it.item_id])
         return jsonify(none=True)
 

@@ -12,7 +12,7 @@ def rate(c, item_id, score=3, rater="a"):
 def test_next_advances_after_rate(client):
     n1 = nxt(client)
     assert n1["position"] == 1 and n1["total"] == 60
-    assert n1["video_url"] == f"/clips/{n1['clip_id']}.mp4?v=2"
+    assert n1["video_url"] == f"/clips/{n1['clip_id']}.mp4?v=3"
     assert rate(client, n1["item_id"]).status_code == 200
     n2 = nxt(client)
     assert n2["item_id"] != n1["item_id"] and n2["position"] == 2
