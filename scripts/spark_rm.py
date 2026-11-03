@@ -5,6 +5,11 @@ ARM picks the input: "full" trains on every instruction with the speed graph bes
     python scripts/spark_rm.py ARM OUT [reward_model train args...]"""
 import faulthandler, json, os, sys
 faulthandler.dump_traceback_later(120, repeat=True)
+# ranks reach the first collective up to ~30 s apart after a restart; NCCL's default ~3 s of connect retries fails
+os.environ.setdefault("NCCL_SOCKET_RETRY_CNT", "600")
+os.environ.setdefault("NCCL_SOCKET_RETRY_SLEEP_MSEC", "500")
+if os.environ.get("NO_FLA"):  # debug: the plain PyTorch linear attention instead of the fla Triton kernels
+    sys.modules["fla"] = None
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from nuance import reward_model as rm
 import transformers.core_model_loading as cml
@@ -59,5 +64,5 @@ def messages(instruction):
 
 
 rm.examples, rm.split, rm.messages = examples, split, messages
-rm.train(["--ratings", f"{D}/ratings.db", "--batches", f"{D}/ctx-rate-02", "--out", out, "--keep-epochs", "--lazy-frames",
+rm.train(["--ratings", f"{D}/ratings.db", "--batches", f"{D}/ctx-rate-02", "--out", out, "--keep-epochs", "--lazy-frames", "--save-steps", "10", "--max-frames", "128", "--gpu-mem-gb", "90",
           "--batch-size", "1"] + (["--frame-w", "512", "--frame-h", "192"] if arm in ("side", "full") else []) + rest)

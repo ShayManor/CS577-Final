@@ -85,8 +85,14 @@ def subsample(exs: list, frac: float, seed: int) -> list:
     return [e for e in exs if e["group"] in keep]
 
 
-def clip_frames(video: str, fps: int = FPS, width: int = FRAME_W, height: int = FRAME_H) -> np.ndarray:
-    """The whole clip at `fps` and width x height, as uint8 (T, H, W, 3) with T even (Qwen pairs frames)."""
+class Clip(np.ndarray):
+    """Decoded frames that carry their own frame rate (lower than FPS when a long clip was thinned)."""
+    fps = None
+
+
+def clip_frames(video: str, fps: int = FPS, width: int = FRAME_W, height: int = FRAME_H, max_frames: int = 0) -> Clip:
+    """The whole clip at `fps` and width x height, as uint8 (T, H, W, 3) with T even (Qwen pairs frames). A clip
+    longer than max_frames is sampled evenly down to max_frames over its whole length, at the matching lower rate."""
     import imageio.v2 as imageio
     from PIL import Image
     rd = imageio.get_reader(video)
@@ -96,9 +102,15 @@ def clip_frames(video: str, fps: int = FPS, width: int = FRAME_W, height: int = 
                   for k, f in enumerate(rd) if int(k * fps / src) != int((k - 1) * fps / src) or k == 0]
     finally:
         rd.close()
+    rate = fps
+    if max_frames and len(frames) > max_frames:
+        rate = fps * (max_frames - 1) / (len(frames) - 1)
+        frames = [frames[i] for i in np.linspace(0, len(frames) - 1, max_frames).round().astype(int)]
     if len(frames) % 2:
         frames.append(frames[-1])
-    return np.stack(frames)
+    out = np.stack(frames).view(Clip)
+    out.fps = rate
+    return out
 
 
 def messages(instruction: str) -> list:
@@ -151,7 +163,8 @@ class RewardModel:
                                                     enable_thinking=False) for _, ins in items]
         vids = [v for v, _ in items]
         # the frames are already sampled and sized; the metadata gives the processor each frame's timestamp
-        meta = [{"fps": self.fps, "total_num_frames": len(v), "frames_indices": list(range(len(v)))} for v in vids]
+        meta = [{"fps": getattr(v, "fps", None) or self.fps, "total_num_frames": len(v),
+                 "frames_indices": list(range(len(v)))} for v in vids]
         return self.processor(text=texts, videos=vids, video_metadata=meta, do_sample_frames=False, do_resize=False,
                               padding=True, return_tensors="pt").to(self.model.device)
 
@@ -218,7 +231,11 @@ def train(argv) -> None:
     ap.add_argument("--lora-r", type=int, default=16)
     ap.add_argument("--lazy-frames", action="store_true",
                     help="decode each clip when it is used instead of holding every decoded clip in memory")
-    ap.add_argument("--resume", action="store_true", help="continue from the last epoch saved in --out (resume.pt)")
+    ap.add_argument("--gpu-mem-gb", type=float, default=0,
+                    help="cap PyTorch's GPU memory, empty its cache every step, and skip a batch that runs out (for "
+                         "GPUs that share memory with the host, where an overrun freezes the node)")
+    ap.add_argument("--resume", action="store_true", help="continue from the last state saved in --out (resume.pt)")
+    ap.add_argument("--save-steps", type=int, default=0, help="with --resume, also save the state every this many steps")
     ap.add_argument("--keep-epochs", action="store_true", help="also save every epoch's adapter under epochs/")
     ap.add_argument("--init-adapter", default=None, help="continue training this saved adapter (it is the one to beat)")
     ap.add_argument("--batch-size", type=int, default=2)
@@ -229,6 +246,7 @@ def train(argv) -> None:
     ap.add_argument("--fps", type=int, default=FPS)
     ap.add_argument("--frame-w", type=int, default=FRAME_W)
     ap.add_argument("--frame-h", type=int, default=FRAME_H)
+    ap.add_argument("--max-frames", type=int, default=0, help="thin longer clips to this many frames (bounds memory)")
     ap.add_argument("--load-4bit", action="store_true")
     ap.add_argument("--device", default=None, help="default: cuda if there is a GPU")
     ap.add_argument("--seed", type=int, default=0)
@@ -254,27 +272,33 @@ def train(argv) -> None:
     if args.lazy_frames:
         class Decode(dict):
             def __missing__(self, v):
-                return clip_frames(v, args.fps, args.frame_w, args.frame_h)
+                return clip_frames(v, args.fps, args.frame_w, args.frame_h, args.max_frames)
         frames = Decode()
     else:
-        frames = {v: clip_frames(v, args.fps, args.frame_w, args.frame_h) for v in {e["video"] for e in tr + va + te}}
+        frames = {v: clip_frames(v, args.fps, args.frame_w, args.frame_h, args.max_frames)
+                  for v in {e["video"] for e in tr + va + te}}
     print(f"decoded {len(frames)} clips ({time.time() - t0:.0f} s)", flush=True)
 
     ck = None
     if args.resume and (Path(args.out) / "resume.pt").exists():  # every rank reads rank 0's files
         ck = torch.load(Path(args.out) / "resume.pt", map_location="cpu", weights_only=False)
-        args.init_adapter = str(Path(args.out) / "epochs" / str(ck["epoch"]))
-        print(f"[rank {rank}] resuming after epoch {ck['epoch']}", flush=True)
+        print(f"[rank {rank}] resuming in epoch {ck['epoch']} after {ck['k']} batches", flush=True)
     rm = RewardModel(args.model, adapter=args.init_adapter, lora_r=0 if args.init_adapter else args.lora_r,
                      load_4bit=args.load_4bit, device=args.device)
     if args.init_adapter:  # a loaded adapter is frozen
         for n, p in rm.model.named_parameters():
             p.requires_grad = "lora_" in n
     rm.fps, rm.width, rm.height = args.fps, args.frame_w, args.frame_h
+    if args.gpu_mem_gb:
+        torch.cuda.set_per_process_memory_fraction(args.gpu_mem_gb * 1e9 / torch.cuda.get_device_properties(0).total_memory)
     rm.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     rm.model.enable_input_require_grads()
+    if ck:
+        rm.model.load_state_dict(ck["lora"], strict=False)
     rm.model.print_trainable_parameters()
     print(f"[rank {rank}] model loaded ({time.time() - t0:.0f} s)", flush=True)
+    if world > 1:  # connect NCCL now, while the ranks are in step; a step later they can be minutes apart and time out
+        torch.distributed.barrier()
     opt = torch.optim.AdamW([p for p in rm.model.parameters() if p.requires_grad], lr=args.lr, weight_decay=0.0)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda k: min(1.0, (k + 1) / args.warmup_steps))
     meta = {"model": rm.model_name, "fps": args.fps, "frame_w": args.frame_w, "frame_h": args.frame_h,
@@ -316,53 +340,83 @@ def train(argv) -> None:
         pred, loss = evaluate(va)
         history.append({"epoch": 0, "train_loss": None, "val": metrics(va, pred, loss)})
         print(json.dumps(history[-1]), flush=True)
+        (out / "history.json").write_text(json.dumps(history, indent=2) + "\n")
+
+    def save_state(epoch, k, losses, rng_state):
+        """Everything needed to continue at batch k of `epoch`, written whole and renamed into place."""
+        lora = {n: v.detach().cpu().clone() for n, v in rm.model.state_dict().items() if "lora_" in n}
+        torch.save({"epoch": epoch, "k": k, "world": world, "losses": losses, "rng": rng_state, "lora": lora, "opt": opt.state_dict(),
+                    "sched": sched.state_dict(), "step": step, "best": best, "best_epoch": best_epoch,
+                    "best_state": best_state}, out / "resume.pt.tmp")
+        os.replace(out / "resume.pt.tmp", out / "resume.pt")
     if args.init_adapter and not ck:
         best = history[0]["val"]["spearman"]
         best_state = {k: v.detach().cpu().clone() for k, v in rm.model.state_dict().items() if "lora_" in k}
         rm.model.save_pretrained(out / "adapter")
         (out / "adapter" / "rm_meta.json").write_text(json.dumps({**meta, "epoch": 0}, indent=2))
     step_log = open(out / "steps.jsonl", "a" if ck else "w")
-    for epoch in range(ck["epoch"] + 1 if ck else 1, args.epochs + 1):
+    # k counts batches of the saving run's shard; a run with a different number of ranks skips the same ratings
+    start, skip = (ck["epoch"], ck["k"] * ck.get("world", world) // world) if ck else (1, 0)
+    for epoch in range(start, args.epochs + 1):
         rm.model.train()
+        rng_state = rng.getstate()  # before the shuffle, so a resumed run draws the same order
         order = list(tr)
         rng.shuffle(order)
         order = order[:len(order) // world * world][rank::world]  # same shuffle on every rank, so disjoint shards
-        losses, acc, acc_mse = [], [], []
+        losses, acc, acc_mse = (list(ck["losses"]) if ck and epoch == start else []), [], []
         for k, i in enumerate(range(0, len(order), args.batch_size)):
+            if epoch == start and k < skip:
+                continue
             b = order[i:i + args.batch_size]
-            logits = rm.digit_logits([(frames[e["video"]], e["instruction"]) for e in b])
-            y = torch.tensor([e["score"] - 1 for e in b], device=logits.device)
-            ce = torch.nn.functional.cross_entropy(logits, y)
-            mse = ((rm.expected(logits) - (y + 1)) ** 2).mean()
-            ((ce + args.mse_weight * mse) / args.grad_accum).backward()
-            losses.append(ce.item())
-            acc.append(ce.item())
-            acc_mse.append(mse.item())
+            try:
+                logits = rm.digit_logits([(frames[e["video"]], e["instruction"]) for e in b])
+                y = torch.tensor([e["score"] - 1 for e in b], device=logits.device)
+                ce = torch.nn.functional.cross_entropy(logits, y)
+                mse = ((rm.expected(logits) - (y + 1)) ** 2).mean()
+                ((ce + args.mse_weight * mse) / args.grad_accum).backward()
+                losses.append(ce.item())
+                acc.append(ce.item())
+                acc_mse.append(mse.item())
+            except torch.OutOfMemoryError:
+                if not args.gpu_mem_gb:
+                    raise
+                logits = y = ce = mse = None  # this rank adds no gradient for the step; the others go on
+                opt.zero_grad()
+                torch.cuda.empty_cache()
+                print(f"[rank {rank}] out of memory on clip {b[0]['clip_id']}, batch skipped", flush=True)
             if (k + 1) % args.grad_accum == 0 or i + args.batch_size >= len(order):
                 if world > 1:  # average the LoRA gradients over ranks, flattened into one all-reduce
-                    gs = [p.grad for p in rm.model.parameters() if p.grad is not None]
-                    flat = torch.cat([g.flatten() for g in gs])
+                    ps = [p for p in rm.model.parameters() if p.requires_grad]
+                    flat = torch.cat([(p.grad if p.grad is not None else torch.zeros_like(p)).flatten() for p in ps])
                     torch.distributed.all_reduce(flat)
                     flat /= world
-                    for g, f in zip(gs, torch._utils._unflatten_dense_tensors(flat, gs)):
-                        g.copy_(f)
+                    for p, f in zip(ps, torch._utils._unflatten_dense_tensors(flat, ps)):
+                        p.grad = f
                 opt.step()
                 sched.step()
                 opt.zero_grad()
                 step += 1
                 step_log.write(json.dumps({"step": step, "epoch": epoch - 1 + (i + len(b)) / len(order),
-                                           "loss": float(np.mean(acc)), "mse": float(np.mean(acc_mse)),
+                                           "loss": float(np.mean(acc)) if acc else None,
+                                           "mse": float(np.mean(acc_mse)) if acc_mse else None,
                                            "s": time.time() - t0}) + "\n")
                 step_log.flush()
+                peak = torch.cuda.max_memory_reserved() / 1e9 if torch.cuda.is_available() else 0
                 print(f"[rank {rank}] step {step} epoch {epoch - 1 + (i + len(b)) / len(order):.2f} "
-                      f"loss {np.mean(acc):.3f} ({time.time() - t0:.0f} s)", flush=True)
+                      f"loss {np.mean(acc) if acc else float('nan'):.3f} peak {peak:.1f} GB ({time.time() - t0:.0f} s)",
+                      flush=True)
+                if args.gpu_mem_gb:
+                    torch.cuda.empty_cache()
+                    torch.cuda.reset_peak_memory_stats()
                 acc, acc_mse = [], []
+                if args.resume and args.save_steps and step % args.save_steps == 0:
+                    save_state(epoch, k + 1, losses, rng_state)
         pred, loss = evaluate(va)
         history.append({"epoch": epoch, "train_loss": float(np.mean(losses)), "val": metrics(va, pred, loss),
                         "s": time.time() - t0})
         print(json.dumps(history[-1]), flush=True)
         (out / "history.json").write_text(json.dumps(history, indent=2) + "\n")
-        if args.keep_epochs or args.resume:
+        if args.keep_epochs:
             rm.model.save_pretrained(out / "epochs" / str(epoch))
             (out / "epochs" / str(epoch) / "rm_meta.json").write_text(json.dumps({**meta, "epoch": epoch}, indent=2))
         rho = history[-1]["val"]["spearman"]
@@ -374,11 +428,8 @@ def train(argv) -> None:
             with open(out / "val_pred.jsonl", "w") as f:
                 for e, p in zip(va, pred):
                     f.write(json.dumps({**e, "pred": p}) + "\n")
-        if args.resume:  # written last and renamed into place, so a job killed mid-epoch resumes from a whole one
-            torch.save({"epoch": epoch, "opt": opt.state_dict(), "sched": sched.state_dict(), "rng": rng.getstate(),
-                        "step": step, "best": best, "best_epoch": best_epoch, "best_state": best_state},
-                       out / "resume.pt.tmp")
-            os.replace(out / "resume.pt.tmp", out / "resume.pt")
+        if args.resume:
+            save_state(epoch + 1, 0, [], rng.getstate())
         if epoch - best_epoch >= args.patience:
             print(f"early stop: no better val spearman since epoch {best_epoch}", flush=True)
             break
